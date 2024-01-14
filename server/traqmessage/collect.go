@@ -36,34 +36,42 @@ func (m *MessagePoller) Run() {
 	ticker := time.Tick(pollingInterval)
 	for range ticker {
 		slog.Info("Start polling")
-		checkpointMutex.Lock()
-
-		now := time.Now()
-		var collectedMessageCount int
-		for {
-			messages, err := collectMessages(lastCheckpoint, now, collectedMessageCount)
+		func(){
+			checkpointMutex.Lock()
+			defer func(){
+				lastCheckpoint = now
+				checkpointMutex.Unlock()
+			}()
+	
+			now := time.Now()
+			collecter, err := newMessageCollecter()
 			if err != nil {
-				slog.Error(fmt.Sprintf("Failled to polling messages: %v", err))
-				break
+				slog.Info("Skip collectMessage")
+				return
 			}
-
-			tmpMessageCount := len(messages.Hits)
-
-			slog.Info(fmt.Sprintf("Collect %d messages", tmpMessageCount))
-			collectedMessageCount += tmpMessageCount
-
-			// 取得したメッセージを使っての処理の呼び出し
-			m.processor.enqueue(&messages.Hits)
-
-			if tmpMessageCount < 100 {
-				break
+			var collectedMessageCount int
+			for {
+				messages, more, err := collecter.collectMessages(lastCheckpoint, now)
+				if err != nil {
+					slog.Error(fmt.Sprintf("Failled to polling messages: %v", err))
+					break
+				}
+	
+				tmpMessageCount := len(*messages)
+	
+				slog.Info(fmt.Sprintf("Collect %d messages", tmpMessageCount))
+				collectedMessageCount += tmpMessageCount
+	
+				// 取得したメッセージを使っての処理の呼び出し
+				m.processor.enqueue(messages)
+	
+				if !more {
+					break
+				}
 			}
-		}
-
-		slog.Info(fmt.Sprintf("%d messages collected totally", collectedMessageCount))
-
-		lastCheckpoint = now
-		checkpointMutex.Unlock()
+	
+			slog.Info(fmt.Sprintf("%d messages collected totally", collectedMessageCount))
+		}()
 	}
 }
 
@@ -139,23 +147,40 @@ func sendMessage(notifyTargetTraqUUID string, messageContent string) error {
 	return nil
 }
 
-func collectMessages(from time.Time, to time.Time, offset int) (*traq.MessageSearchResult, error) {
+// メッセージの取得をする
+type messageCollecter struct {
+	client *traq.APIClient
+	auth context.Context
+	offset int32
+}
+func newMessageCollecter() (*messageCollecter, error) {
 	if model.ACCESS_TOKEN == "" {
-		slog.Info("Skip collectMessage")
-		return &traq.MessageSearchResult{}, nil
+		return nil, fmt.Errorf("Error: no ACCESS_TOKEN")
 	}
 
-	client := traq.NewAPIClient(traq.NewConfiguration())
-	auth := context.WithValue(context.Background(), traq.ContextAccessToken, model.ACCESS_TOKEN)
+	return &messageCollecter{
+		client: traq.NewAPIClient(traq.NewConfiguration()),
+		auth: context.WithValue(context.Background(), traq.ContextAccessToken, model.ACCESS_TOKEN),
+		offset: 0,
+	}, nil
+}
 
+func (c *messageCollecter) collectMessages(from time.Time, to time.Time) (*[]traq.Message, bool, error) {
 	// 1度での取得上限は100まで　それ以上はoffsetを使うこと
 	// https://github.com/traPtitech/traQ/blob/47ed2cf94b2209c8444533326dee2a588936d5e0/service/search/engine.go#L51
-	result, _, err := client.MessageApi.SearchMessages(auth).After(from).Before(to).Limit(100).Offset(int32(offset)).Execute()
+	limit := 99
+	result, _, err := c.client.MessageApi.SearchMessages(c.auth).After(from).Before(to).Limit(limit+1).Offset(c.offset).Execute()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-
-	return result, nil
+	
+	messages := result.Hits
+	more := limit < len(messages)
+	if more {
+		messages = messages[:limit]
+	}
+	c.offset += len(messages)
+	return &messages, more, nil
 }
 
 func ConvertMessageHits(messages []traq.Message) (model.MessageList, error) {
